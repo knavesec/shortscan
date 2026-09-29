@@ -128,6 +128,8 @@ var pathSuffixes = [...]string{"/", "", "/.aspx", "?aspxerrorpath=/", "/.aspx?as
 
 // Hardcoded list of extensions to try with wordlist entries
 var extensions = [...]string{
+	// No extension (for files like readme, license, makefile, etc.)
+	"",
 	// ASP.NET web pages and handlers
 	".asp", ".aspx", ".asmx", ".ashx", ".asa", ".asax", ".ascx", ".axd", ".svc",
 	".aspx.cs",
