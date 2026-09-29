@@ -8,26 +8,26 @@
 package shortscan
 
 import (
-	"os"
-	"fmt"
-	"sync"
-	"time"
 	"bufio"
-	"embed"
-	"regexp"
-	"strings"
-	"math/rand"
 	"crypto/tls"
+	"embed"
 	"encoding/json"
-	"net/http"
-	"net/http/httputil"
-	"github.com/fatih/color"
+	"fmt"
 	"github.com/alexflint/go-arg"
+	"github.com/bitquark/shortscan/pkg/levenshtein"
 	"github.com/bitquark/shortscan/pkg/maths"
 	"github.com/bitquark/shortscan/pkg/shortutil"
-	"github.com/bitquark/shortscan/pkg/levenshtein"
+	"github.com/fatih/color"
 	log "github.com/sirupsen/logrus"
+	"math/rand"
+	"net/http"
+	"net/http/httputil"
 	nurl "net/url"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
 )
 
 type baseRequest struct {
@@ -126,6 +126,67 @@ var httpMethods = [...]string{
 // Path suffixes to try
 var pathSuffixes = [...]string{"/", "", "/.aspx", "?aspxerrorpath=/", "/.aspx?aspxerrorpath=/", "/.asmx", "/.vb"}
 
+// Hardcoded list of extensions to try with wordlist entries
+var extensions = [...]string{
+	// ASP.NET web pages and handlers
+	".asp", ".aspx", ".asmx", ".ashx", ".asa", ".asax", ".ascx", ".axd", ".svc",
+	".aspx.cs",
+	// ASP.NET layouts and views
+	".master", ".cshtml", ".vbhtml",
+	// HTML and server-side includes
+	".htm", ".html", ".shtml", ".shtm", ".stm",
+	// PHP
+	".php", ".php3", ".php4", ".php5",
+	// JSP and Java
+	".jsp", ".jspx", ".jsf",
+	// ColdFusion
+	".cfm", ".cfml",
+	// Other web frameworks
+	".do", ".action",
+	// Source code files
+	".cs", ".vb", ".jsl",
+	// Visual Studio project files
+	".csproj", ".vbproj", ".vjsproj", ".sln",
+	// Web services
+	".disco", ".vsdisco", ".wsdl", ".soap", ".rem",
+	// XML schemas and models
+	".xsd", ".edmx", ".xamlx",
+	// Scripts
+	".ps1", ".sh", ".js", ".ps",
+	// Static resources
+	".css",
+	// Data formats
+	".txt", ".xml", ".json", ".jsonl",
+	// Configuration files
+	".config", ".exe.config", ".dll.xml", ".conf", ".browser", ".sitemap", ".skin",
+	// Module files
+	".module", ".mod",
+	// Resource files
+	".resources", ".resx",
+	// License files
+	".lic", ".licx", ".webinfo",
+	// Compilation and build
+	".compile", ".refresh", ".exclude",
+	// Backup files
+	".bak", ".old", ".backup", ".orig", ".original", ".modified",
+	// Include files
+	".inc",
+	// Executables and libraries
+	".exe", ".dll", ".cpl",
+	// Certificates
+	".cer", ".crt", ".pfx",
+	// Windows shortcuts
+	".url", ".lnk",
+	// Documents
+	".pdf", ".doc", ".docx", ".xls", ".xlsx",
+	// Archives
+	".zip", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".bzip",
+	// Database files
+	".sql", ".log", ".db", ".mdb", ".ldb", ".mdf", ".ldf",
+	// Legacy/specialized
+	".idc", ".cdx", ".cd", ".sdm",
+}
+
 // Embed the default wordlist
 //
 //go:embed resources/wordlist.txt
@@ -139,7 +200,8 @@ var checksumRegex *regexp.Regexp
 // Command-line arguments and help
 type arguments struct {
 	Urls         []string `arg:"positional,required" help:"url to scan (multiple URLs can be provided; a file containing URLs can be specified with an «at» prefix, for example: @urls.txt)" placeholder:"URL"`
-	Wordlist     string   `arg:"-w" help:"combined wordlist + rainbow table generated with shortutil" placeholder:"FILE"`
+	Wordlist     string   `arg:"-w" help:"rainbow table wordlist generated with shortutil (format: checksums\\tfilename83\\text83\\tfilename\\textension)" placeholder:"FILE"`
+	RawWordlist  string   `arg:"--rawwordlist,-r" help:"simple wordlist with one word per line (extensions tested dynamically against hardcoded list)" placeholder:"FILE"`
 	Headers      []string `arg:"--header,-H,separate" help:"header to send with each request (use multiple times for multiple headers)"`
 	Concurrency  int      `arg:"-c" help:"number of requests to make at once" default:"20"`
 	Timeout      int      `arg:"-t" help:"per-request timeout in seconds" placeholder:"SECONDS" default:"10"`
@@ -323,9 +385,9 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 						var fnr, method string
 						if args.Autocomplete != "none" {
 
-							// Look up candidate filenames if the file looks like a checkummed alias (e.g. A5FAB~1.HTM) and a rainbow table was provided
+							// Look up candidate filenames if the file looks like a checksummed alias (e.g. A5FAB~1.HTM)
 							var fnc []wordlistRecord
-							if cm := ac.wordlist.isRainbow && checksumRegex.MatchString(br.file); cm {
+							if checksumRegex.MatchString(br.file) {
 								fnc = autodechecksum(ac, br)
 							}
 
@@ -556,11 +618,44 @@ func autocomplete(ac *attackConfig, br baseRequest) []wordlistRecord {
 	var fs = make(map[string]wordlistRecord)
 	var ch = make(chan wordlistRecord, 1024)
 	go getWordlist(ch, ac)
+
+	// Extract the extension part (skip the leading dot if present)
+	extPart := br.ext
+	if len(extPart) > 0 && extPart[0] == '.' {
+		extPart = extPart[1:]
+	}
+
 	for record := range ch {
 
-		// If the discovered filename and extension match the wordlist entry add the word to the list
-		if br.file == record.filename83 && br.ext[maths.Min(len(br.ext), 1):] == record.extension83 {
-			fs[record.filename+record.extension] = record
+		if ac.wordlist.isRainbow {
+			// Rainbow table mode: direct matching on pre-computed 8.3 names
+			if br.file == record.filename83 && extPart == record.extension83 {
+				fs[record.filename+record.extension] = record
+			}
+		} else {
+			// Raw wordlist mode: combine words with all matching extensions
+			if br.file == record.filename83 {
+
+				// Try all hardcoded extensions
+				for _, fullExt := range extensions {
+
+					// Generate 8.3 version of this extension
+					_, _, ext83 := shortutil.Gen8dot3("", fullExt)
+
+					// If this extension's 8.3 version matches the discovered extension
+					if extPart == ext83 {
+						// Create a combined candidate
+						fullname := record.filename + fullExt
+						fs[fullname] = wordlistRecord{
+							checksums:   "",
+							filename:    record.filename,
+							extension:   fullExt,
+							filename83:  record.filename83,
+							extension83: ext83,
+						}
+					}
+				}
+			}
 		}
 
 	}
@@ -590,17 +685,57 @@ func autodechecksum(ac *attackConfig, br baseRequest) []wordlistRecord {
 	prefix, checksum := br.file[:l], br.file[l:]
 	log.WithFields(log.Fields{"file": br.file, "prefix": prefix, "checksum": checksum}).Info("Possible checksummed alias")
 
+	// Extract the extension part (skip the leading dot if present)
+	extPart := br.ext
+	if len(extPart) > 0 && extPart[0] == '.' {
+		extPart = extPart[1:]
+	}
+
 	// Match the checksum and prefix against each wordlist entry
 	var fs = make(map[string]wordlistRecord)
 	var ch = make(chan wordlistRecord, 1024)
 	go getWordlist(ch, ac)
 	for record := range ch {
 
-		// If the potential checksum matches a wordlist checksum and the filename prefix and extension match
-		for i := 0; i < len(record.checksums); i += 4 {
-			c := record.checksums[i : i+4]
-			if c == checksum && strings.HasPrefix(strings.ToUpper(record.filename), prefix) && strings.HasPrefix(strings.ToUpper(record.extension), br.ext) {
-				fs[record.filename+record.extension] = record
+		if ac.wordlist.isRainbow {
+			// Rainbow table mode: use pre-computed checksums
+			// If the potential checksum matches a wordlist checksum and the filename prefix and extension match
+			for i := 0; i < len(record.checksums); i += 4 {
+				c := record.checksums[i : i+4]
+				if c == checksum && strings.HasPrefix(strings.ToUpper(record.filename), prefix) && strings.HasPrefix(strings.ToUpper(record.extension), br.ext) {
+					fs[record.filename+record.extension] = record
+				}
+			}
+		} else {
+			// Raw wordlist mode: compute checksums on-the-fly
+			// If the word starts with the prefix
+			if strings.HasPrefix(strings.ToUpper(record.filename), prefix) {
+
+				// Try all hardcoded extensions
+				for _, fullExt := range extensions {
+
+					// Generate 8.3 version of this extension
+					_, _, ext83 := shortutil.Gen8dot3("", fullExt)
+
+					// If this extension's 8.3 version matches the discovered extension
+					if extPart == ext83 {
+
+						// Compute checksum for this word+extension combination
+						fullname := record.filename + fullExt
+						computed := shortutil.Checksum(fullname)
+
+						// If the computed checksum matches the discovered checksum
+						if computed == checksum {
+							fs[fullname] = wordlistRecord{
+								checksums:   computed,
+								filename:    record.filename,
+								extension:   fullExt,
+								filename83:  record.filename83,
+								extension83: ext83,
+							}
+						}
+					}
+				}
 			}
 		}
 
@@ -855,11 +990,11 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 		}
 
 		// Loop through path suffixes
-		outerEscape:
+	outerEscape:
 		for _, suffix := range pathSuffixes[:pc] {
 
 			// Loop through each method
-			methodEscape:
+		methodEscape:
 			for _, method := range httpMethods[:mc] {
 
 				// Make some requests for non-existent files
@@ -1122,9 +1257,22 @@ func Run() {
 	// Compile the checksum detection regex
 	checksumRegex = regexp.MustCompile(".{1,2}[0-9A-F]{4}")
 
+	// Validate wordlist arguments
+	if args.Wordlist != "" && args.RawWordlist != "" {
+		log.Fatal("Cannot specify both --wordlist and --rawwordlist")
+	}
+
 	// Select the wordlist
 	var s *bufio.Scanner
-	if args.Wordlist != "" {
+	if args.RawWordlist != "" {
+		log.WithFields(log.Fields{"file": args.RawWordlist}).Info("Using raw wordlist")
+		fh, err := os.Open(args.RawWordlist)
+		if err != nil {
+			log.WithFields(log.Fields{"err": err}).Fatal("Unable to open raw wordlist")
+		}
+		s = bufio.NewScanner(fh)
+		wc.isRainbow = false
+	} else if args.Wordlist != "" {
 		log.WithFields(log.Fields{"file": args.Wordlist}).Info("Using custom wordlist")
 		fh, err := os.Open(args.Wordlist)
 		if err != nil {
@@ -1144,10 +1292,11 @@ func Run() {
 		// Read the line
 		line := s.Text()
 
-		// Check the first line for the rainbow table magic value
-		if n == 0 && line == rainbowMagic {
+		// Check the first line for the rainbow table magic value (only if not using rawwordlist)
+		if n == 0 && args.RawWordlist == "" && line == rainbowMagic {
 			wc.isRainbow = true
 			log.Info("Rainbow table provided, enabling auto dechecksumming")
+			n++
 			continue
 		}
 
@@ -1162,7 +1311,6 @@ func Run() {
 			// Check tab count
 			if strings.Count(line, "\t") != 4 {
 				log.WithFields(log.Fields{"line": line}).Fatal("Wordlist entry invalid (incorrect tab count)")
-				log.Fatal("")
 			}
 
 			// Split the line and add the word
@@ -1175,22 +1323,28 @@ func Run() {
 
 		} else {
 
-			// Split the line into file and extension and generate an 8.3 version
-			var r wordlistRecord
-			if p := strings.LastIndex(line, "."); p > 0 && line[0] != '.' {
-				f, e := line[:p], line[p:]
-				_, f83, e83 := shortutil.Gen8dot3(f, e)
-				r = wordlistRecord{"", f, e, f83, e83}
-			} else {
-				_, f83, _ := shortutil.Gen8dot3(line, "")
-				r = wordlistRecord{"", line, "", f83, ""}
+			// Raw wordlist mode: strip any extension if present (we only want base words)
+			word := strings.TrimSpace(line)
+			if p := strings.LastIndex(word, "."); p > 0 && word[0] != '.' {
+				word = word[:p]
 			}
-			wc.wordlist = append(wc.wordlist, r)
+
+			// Generate 8.3 version of the word (without extension)
+			_, word83, _ := shortutil.Gen8dot3(word, "")
+
+			// Add to wordlist
+			wc.wordlist = append(wc.wordlist, wordlistRecord{
+				checksums:   "",
+				filename:    word,
+				extension:   "",
+				filename83:  word83,
+				extension83: "",
+			})
 
 		}
 
 		// Next
-		n += 1
+		n++
 
 	}
 
